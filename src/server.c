@@ -199,12 +199,19 @@ static void handle_new_client(struct srv_ctx *ctx, const struct fake_tcp_hdr *h,
 	pr_debug("new session %s", netaddr_str(&h->src, buf, sizeof(buf)));
 }
 
+/*
+ * Deliberately does NOT touch last_active for a bare keepalive ACK (the
+ * common case once established): a keepalive proves the *client* is
+ * still there, not that the local peer behind it is -- touching here
+ * would make session_reap_expired() unable to ever reclaim a session
+ * whose real traffic has long stopped, as long as the client keeps
+ * sending keepalives for it. Only genuine progress (finishing the
+ * handshake, forwarding real payload) counts as activity.
+ */
 static void handle_client_packet(struct srv_ctx *ctx, struct session *s,
 				  const struct fake_tcp_hdr *h,
 				  const uint8_t *payload, size_t payload_len)
 {
-	session_touch(&ctx->pool, s);
-
 	if (h->flags & (TCPF_RST | TCPF_FIN)) {
 		char buf[64];
 
@@ -215,6 +222,7 @@ static void handle_client_packet(struct srv_ctx *ctx, struct session *s,
 
 	if (s->state == SESS_SYN_RCVD && (h->flags & TCPF_ACK) && !payload_len) {
 		s->state = SESS_ESTABLISHED;
+		session_touch(&ctx->pool, s);
 		return;
 	}
 	if (s->state == SESS_SYN_RCVD)
@@ -222,6 +230,8 @@ static void handle_client_packet(struct srv_ctx *ctx, struct session *s,
 
 	if (!payload_len)
 		return; /* bare keepalive ACK, nothing to forward */
+
+	session_touch(&ctx->pool, s);
 
 	if (send(s->remote_fd, payload, payload_len, 0) < 0)
 		pr_warn("forward to backend failed: %s", strerror(errno));

@@ -299,24 +299,38 @@ static void handle_raw_readable(struct cli_ctx *ctx)
 	}
 }
 
-/* Walk sessions from the LRU tail (oldest first) and nudge anything
- * idle for >= keepalive_sec with a bare ACK, to keep NAT/conntrack
- * state alive on the path to the server. Stops at the first entry
- * that's still fresh, since the list stays ordered by recency. */
+/*
+ * Walk the tail of the *real-activity* LRU (session_touch()'s list, still
+ * ordered by last_active) and nudge anything genuinely idle for >=
+ * keepalive_sec with a bare ACK, to keep NAT/conntrack state alive on the
+ * path to the server. Stops at the first entry that's still fresh, since
+ * the list stays ordered by recency.
+ *
+ * Deliberately does NOT call session_touch(): a keepalive is synthetic
+ * traffic, not evidence the local peer is still there, so it must never
+ * feed last_active -- otherwise an abandoned session would keep getting
+ * kept alive by its own keepalives forever and never reach
+ * session_reap_expired()'s cutoff. last_kick only paces the resend rate
+ * so the same idle session isn't re-sent every timer tick.
+ */
 static void send_keepalives(struct cli_ctx *ctx)
 {
-	time_t cutoff = now_sec() - ctx->cfg->keepalive_sec;
+	time_t now = now_sec();
+	time_t idle_cutoff = now - ctx->cfg->keepalive_sec;
 	struct list_head *pos, *n;
 
 	for (pos = ctx->pool.lru.prev, n = pos->prev; pos != &ctx->pool.lru;
 	     pos = n, n = pos->prev) {
 		struct session *s = list_entry(pos, struct session, lru);
 
-		if (s->last_active > cutoff)
+		if (s->last_active > idle_cutoff)
 			break;
-		if (s->state == SESS_ESTABLISHED)
-			send_pkt(ctx, s, TCPF_ACK, NULL, 0);
-		session_touch(&ctx->pool, s);
+		if (s->state != SESS_ESTABLISHED)
+			continue;
+		if (now - s->last_kick < ctx->cfg->keepalive_sec)
+			continue;
+		send_pkt(ctx, s, TCPF_ACK, NULL, 0);
+		s->last_kick = now;
 	}
 }
 

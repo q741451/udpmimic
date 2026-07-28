@@ -46,7 +46,8 @@ struct session {
 	uint32_t rcv_nxt;
 	int      remote_fd;		/* server only: UDP socket connected to backend, else -1 */
 
-	time_t   last_active;
+	time_t   last_active;		/* real payload only -- what session_reap_expired() judges idleness by */
+	time_t   last_kick;		/* client only: last keepalive sent; paces re-sends, never feeds last_active */
 	uint8_t  state;
 };
 
@@ -68,7 +69,14 @@ struct session *session_lookup(struct session_pool *pool, const struct netaddr *
 /* Returns NULL if the pool is exhausted. Inserts into hash + LRU head. */
 struct session *session_create(struct session_pool *pool, const struct netaddr *key);
 
-/* Marks activity: bumps last_active and moves to LRU head. */
+/*
+ * Marks activity: bumps last_active and moves to LRU head. Callers must
+ * only call this for genuine payload/handshake progress, never for
+ * synthetic traffic (keepalives, their acks) -- last_active is the sole
+ * signal session_reap_expired() judges idleness by, so anything that
+ * touches it on its own initiative would make an abandoned session
+ * immortal instead of ever timing out.
+ */
 void session_touch(struct session_pool *pool, struct session *s);
 
 /* Removes from hash + LRU and returns the node to the freelist. */
