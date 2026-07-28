@@ -11,7 +11,10 @@ static void usage(const char *prog)
 	fprintf(stderr,
 		"usage:\n"
 		"  %s -s -l <listen_ip:port> -r <backend_ip:port> [-n max_sessions] [-t timeout_sec] [-v]\n"
-		"  %s -c -l <local_udp_ip:port> -r <server_ip:port> [-n max_sessions] [-k keepalive_sec] [-v]\n",
+		"  %s -c -l <local_udp_ip:port> -r <server_ip:port> [-n max_sessions] [-k keepalive_sec] [-v]\n"
+		"\n"
+		"addresses: \"ip:port\" for IPv4, \"[ip6]:port\" for IPv6 (e.g. \"[::]:8390\").\n"
+		"  -s -l [::]:PORT also accepts IPv4 clients on the same port (dual-stack).\n",
 		prog, prog);
 }
 

@@ -3,6 +3,12 @@
  * udpmimic server, one independent fake-TCP "connection" per local
  * peer so the server's existing multi-session logic just sees more
  * clients.
+ *
+ * Address families: the outer raw socket's family follows
+ * cfg->remote_addr (there is only one remote server, of one family).
+ * The local UDP socket's family follows cfg->listen_addr independently
+ * -- e.g. a v6-only local app behind a client tunneling over v4 to the
+ * server, or vice versa, both work.
  */
 #include <unistd.h>
 #include <signal.h>
@@ -11,7 +17,6 @@
 #include <sys/random.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <arpa/inet.h>
 
 #include "common.h"
 #include "rawsock.h"
@@ -30,19 +35,13 @@ static void on_signal(int sig)
 	g_stop = 1;
 }
 
-/* Secondary index: local UDP peer address -> session, chained via s->pnext. */
+/* Secondary index: local UDP peer address -> session, chained via
+ * s->pnext. Reuses the same netaddr_hash()/netaddr_equal() as the
+ * primary table in session.c, just against a different key field. */
 struct peer_index {
 	struct session **buckets;
 	size_t           nbuckets;
 };
-
-static size_t peer_hash(const struct peer_index *idx, uint32_t ip, uint16_t port)
-{
-	uint64_t k = ((uint64_t)ip << 16) | port;
-
-	k *= 0x9E3779B97F4A7C15ULL;
-	return (size_t)(k >> 48) & (idx->nbuckets - 1);
-}
 
 static int peer_index_init(struct peer_index *idx, size_t capacity)
 {
@@ -55,12 +54,12 @@ static int peer_index_init(struct peer_index *idx, size_t capacity)
 	return idx->buckets ? 0 : -1;
 }
 
-static struct session *peer_index_lookup(struct peer_index *idx, uint32_t ip, uint16_t port)
+static struct session *peer_index_lookup(struct peer_index *idx, const struct netaddr *peer)
 {
-	struct session *s = idx->buckets[peer_hash(idx, ip, port)];
+	struct session *s = idx->buckets[netaddr_hash(idx->nbuckets, peer)];
 
 	while (s) {
-		if (s->inner_peer.sin_addr.s_addr == ip && s->inner_peer.sin_port == port)
+		if (netaddr_equal(&s->inner_peer, peer))
 			return s;
 		s = s->pnext;
 	}
@@ -69,7 +68,7 @@ static struct session *peer_index_lookup(struct peer_index *idx, uint32_t ip, ui
 
 static void peer_index_insert(struct peer_index *idx, struct session *s)
 {
-	size_t b = peer_hash(idx, s->inner_peer.sin_addr.s_addr, s->inner_peer.sin_port);
+	size_t b = netaddr_hash(idx->nbuckets, &s->inner_peer);
 
 	s->pnext = idx->buckets[b];
 	idx->buckets[b] = s;
@@ -77,7 +76,7 @@ static void peer_index_insert(struct peer_index *idx, struct session *s)
 
 static void peer_index_remove(struct peer_index *idx, struct session *s)
 {
-	size_t b = peer_hash(idx, s->inner_peer.sin_addr.s_addr, s->inner_peer.sin_port);
+	size_t b = netaddr_hash(idx->nbuckets, &s->inner_peer);
 	struct session **pp = &idx->buckets[b];
 
 	while (*pp) {
@@ -96,9 +95,8 @@ struct cli_ctx {
 	int raw_fd;
 	int local_fd;
 	int epoll_fd;
-	uint32_t local_ip;	/* our outbound interface addr, network byte order */
+	struct netaddr local_addr;	/* our outbound interface addr, family = remote's */
 	uint16_t next_port;
-	uint16_t port_tries;	/* bound on the port-allocation search below */
 };
 
 static uint32_t rand_isn(void)
@@ -110,39 +108,16 @@ static uint32_t rand_isn(void)
 	return v;
 }
 
-/* getsockname() trick: connect()ing a UDP socket sends nothing, it just
- * makes the kernel resolve which local interface address routes to
- * remote_addr, which is exactly the source address our raw packets
- * need to carry. */
-static int learn_local_ip(struct cli_ctx *ctx)
-{
-	int fd = socket(AF_INET, SOCK_DGRAM, 0);
-	struct sockaddr_in sa;
-	socklen_t sl = sizeof(sa);
-	int ret = -1;
-
-	if (fd < 0)
-		return -1;
-	if (connect(fd, (const struct sockaddr *)&ctx->cfg->remote_addr,
-		    sizeof(ctx->cfg->remote_addr)) == 0 &&
-	    getsockname(fd, (struct sockaddr *)&sa, &sl) == 0) {
-		ctx->local_ip = sa.sin_addr.s_addr;
-		ret = 0;
-	}
-	close(fd);
-	return ret;
-}
-
 static uint16_t alloc_port(struct cli_ctx *ctx)
 {
 	uint16_t tries;
+	struct netaddr key = { .family = ctx->cfg->remote_addr.family };
 
 	for (tries = 0; tries < PORT_RANGE; tries++) {
-		uint16_t port = PORT_BASE + ctx->next_port;
-
+		key.port = PORT_BASE + ctx->next_port;
 		ctx->next_port = (ctx->next_port + 1) % PORT_RANGE;
-		if (!session_lookup(&ctx->pool, 0, port))
-			return port;
+		if (!session_lookup(&ctx->pool, &key))
+			return key.port;
 	}
 	return 0; /* exhausted */
 }
@@ -152,22 +127,23 @@ static int send_pkt(struct cli_ctx *ctx, const struct session *s, uint8_t flags,
 {
 	uint8_t buf[RECV_BATCH_BUF];
 	struct fake_tcp_hdr h = {
-		.saddr = s->local_ip,
-		.daddr = ctx->cfg->remote_addr.sin_addr.s_addr,
-		.sport = s->key_port,
-		.dport = ntohs(ctx->cfg->remote_addr.sin_port),
+		.src = s->local,
+		.dst = ctx->cfg->remote_addr,
 		.seq = s->snd_nxt,
 		.ack = s->rcv_nxt,
 		.flags = flags,
 		.window = 65535,
 	};
-	int len = rawsock_build(buf, sizeof(buf), &h, payload, payload_len);
+	int len;
 
+	h.src.port = s->key.port;
+
+	len = rawsock_build(buf, sizeof(buf), &h, payload, payload_len);
 	if (len < 0) {
 		pr_warn("packet too big to build (%zu payload bytes)", payload_len);
 		return -1;
 	}
-	return rawsock_send(ctx->raw_fd, buf, (size_t)len, h.daddr);
+	return rawsock_send(ctx->raw_fd, buf, (size_t)len, &ctx->cfg->remote_addr);
 }
 
 static void close_session(struct cli_ctx *ctx, struct session *s)
@@ -180,7 +156,7 @@ static void on_expire(struct session *s, void *arg)
 {
 	struct cli_ctx *ctx = arg;
 
-	pr_debug("local session port=%u expired", s->key_port);
+	pr_debug("local session port=%u expired", s->key.port);
 	send_pkt(ctx, s, TCPF_RST | TCPF_ACK, NULL, 0);
 	peer_index_remove(&ctx->peers, s);
 }
@@ -190,19 +166,23 @@ static void handle_local_readable(struct cli_ctx *ctx)
 	uint8_t buf[RECV_BATCH_BUF];
 
 	for (;;) {
-		struct sockaddr_in peer;
-		socklen_t peer_len = sizeof(peer);
+		struct sockaddr_storage ss;
+		struct netaddr peer;
+		socklen_t peer_len = sizeof(ss);
 		ssize_t n = recvfrom(ctx->local_fd, buf, sizeof(buf), 0,
-				      (struct sockaddr *)&peer, &peer_len);
+				      (struct sockaddr *)&ss, &peer_len);
 		struct session *s;
+		uint16_t port;
+		char abuf[64];
 
 		if (n < 0) {
 			if (errno != EAGAIN && errno != EWOULDBLOCK)
 				pr_warn("local recv: %s", strerror(errno));
 			return;
 		}
+		netaddr_from_sockaddr((struct sockaddr *)&ss, &peer);
 
-		s = peer_index_lookup(&ctx->peers, peer.sin_addr.s_addr, peer.sin_port);
+		s = peer_index_lookup(&ctx->peers, &peer);
 		if (s) {
 			session_touch(&ctx->pool, s);
 			if (s->state != SESS_ESTABLISHED)
@@ -212,19 +192,23 @@ static void handle_local_readable(struct cli_ctx *ctx)
 			continue;
 		}
 
-		uint16_t port = alloc_port(ctx);
+		port = alloc_port(ctx);
 		if (!port) {
 			pr_warn("outer port space exhausted, dropping new local peer");
 			continue;
 		}
-		s = session_create(&ctx->pool, 0, port);
+		{
+			struct netaddr key = { .family = ctx->cfg->remote_addr.family, .port = port };
+
+			s = session_create(&ctx->pool, &key);
+		}
 		if (!s) {
 			pr_warn("session pool exhausted (max=%d), dropping new local peer",
 				ctx->cfg->max_sessions);
 			continue;
 		}
 		s->inner_peer = peer;
-		s->local_ip = ctx->local_ip;
+		s->local = ctx->local_addr;
 		s->snd_nxt = rand_isn();
 		s->state = SESS_SYN_SENT;
 		peer_index_insert(&ctx->peers, s);
@@ -236,8 +220,8 @@ static void handle_local_readable(struct cli_ctx *ctx)
 		send_pkt(ctx, s, TCPF_SYN | TCPF_PSH, buf, (size_t)n);
 		s->snd_nxt += 1 + (uint32_t)n;
 
-		pr_debug("new local session peer=%s:%u port=%u",
-			  inet_ntoa(peer.sin_addr), ntohs(peer.sin_port), port);
+		pr_debug("new local session peer=%s port=%u",
+			  netaddr_str(&peer, abuf, sizeof(abuf)), port);
 	}
 }
 
@@ -246,31 +230,47 @@ static void handle_raw_readable(struct cli_ctx *ctx)
 	uint8_t buf[RECV_BATCH_BUF];
 
 	for (;;) {
-		ssize_t n = recv(ctx->raw_fd, buf, sizeof(buf), 0);
+		struct sockaddr_storage from;
+		socklen_t from_len = sizeof(from);
+		ssize_t n = recvfrom(ctx->raw_fd, buf, sizeof(buf), 0,
+				      (struct sockaddr *)&from, &from_len);
 		struct fake_tcp_hdr h;
+		struct netaddr peer;
 		const uint8_t *payload;
 		size_t payload_len;
 		struct session *s;
+		struct netaddr key;
 
 		if (n < 0) {
 			if (errno != EAGAIN && errno != EWOULDBLOCK)
 				pr_warn("raw recv: %s", strerror(errno));
 			return;
 		}
-		if (rawsock_parse(buf, (size_t)n, &h, &payload, &payload_len) < 0)
+		if (rawsock_parse(ctx->cfg->remote_addr.family, buf, (size_t)n, &h,
+				   &payload, &payload_len) < 0)
 			continue;
-		if (h.saddr != ctx->cfg->remote_addr.sin_addr.s_addr ||
-		    h.sport != ntohs(ctx->cfg->remote_addr.sin_port))
+		/* Authoritative source address from the kernel -- the only
+		 * way to get it at all for IPv6 (see rawsock.h). TCP port
+		 * stays as parsed from the TCP header. */
+		netaddr_from_sockaddr((struct sockaddr *)&from, &peer);
+		h.src.family = peer.family;
+		h.src.ip = peer.ip;
+
+		if (!netaddr_equal(&h.src, &ctx->cfg->remote_addr))
 			continue; /* raw socket sees all TCP on the host; filter tightly */
 
-		s = session_lookup(&ctx->pool, 0, h.dport);
+		memset(&key, 0, sizeof(key));
+		key.family = ctx->cfg->remote_addr.family;
+		key.port = h.dst.port;
+
+		s = session_lookup(&ctx->pool, &key);
 		if (!s)
 			continue;
 
 		session_touch(&ctx->pool, s);
 
 		if (h.flags & (TCPF_RST | TCPF_FIN)) {
-			pr_debug("session port=%u closed by peer", s->key_port);
+			pr_debug("session port=%u closed by peer", s->key.port);
 			close_session(ctx, s);
 			continue;
 		}
@@ -286,8 +286,14 @@ static void handle_raw_readable(struct cli_ctx *ctx)
 		if (!payload_len)
 			continue;
 
-		sendto(ctx->local_fd, payload, payload_len, 0,
-		       (const struct sockaddr *)&s->inner_peer, sizeof(s->inner_peer));
+		{
+			struct sockaddr_storage ss;
+			socklen_t sl;
+
+			netaddr_to_sockaddr(&s->inner_peer, &ss, &sl);
+			sendto(ctx->local_fd, payload, payload_len, 0,
+			       (const struct sockaddr *)&ss, sl);
+		}
 		s->rcv_nxt = h.seq + (uint32_t)payload_len;
 		send_pkt(ctx, s, TCPF_ACK, NULL, 0);
 	}
@@ -336,6 +342,9 @@ int client_main(const struct config *cfg)
 		.it_interval = { .tv_sec = KEEPALIVE_TICK_SEC },
 		.it_value = { .tv_sec = KEEPALIVE_TICK_SEC },
 	};
+	char abuf[64], rbuf[64];
+	struct sockaddr_storage ss;
+	socklen_t sl;
 
 	memset(&ctx, 0, sizeof(ctx));
 	ctx.cfg = cfg;
@@ -346,26 +355,26 @@ int client_main(const struct config *cfg)
 		pr_err("peer index alloc failed");
 		return 1;
 	}
-	if (learn_local_ip(&ctx) < 0) {
-		pr_err("could not determine local outbound address toward %s:%u: %s",
-		       inet_ntoa(cfg->remote_addr.sin_addr),
-		       ntohs(cfg->remote_addr.sin_port), strerror(errno));
+	if (netaddr_route_lookup(&cfg->remote_addr, &ctx.local_addr) < 0) {
+		pr_err("could not determine local outbound address toward %s: %s",
+		       netaddr_str(&cfg->remote_addr, rbuf, sizeof(rbuf)), strerror(errno));
 		return 1;
 	}
 
-	ctx.raw_fd = rawsock_open();
+	ctx.raw_fd = rawsock_open(cfg->remote_addr.family);
 	if (ctx.raw_fd < 0)
 		return 1;
+	rawsock_filter_port(ctx.raw_fd, cfg->remote_addr.family, TCP_PORT_SRC, cfg->remote_addr.port);
 
-	ctx.local_fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+	ctx.local_fd = socket(cfg->listen_addr.family, SOCK_DGRAM | SOCK_NONBLOCK, 0);
 	if (ctx.local_fd < 0) {
 		pr_err("socket(local UDP): %s", strerror(errno));
 		return 1;
 	}
-	if (bind(ctx.local_fd, (const struct sockaddr *)&cfg->listen_addr,
-		 sizeof(cfg->listen_addr)) < 0) {
-		pr_err("bind(local UDP %s:%u): %s", inet_ntoa(cfg->listen_addr.sin_addr),
-		       ntohs(cfg->listen_addr.sin_port), strerror(errno));
+	netaddr_to_sockaddr(&cfg->listen_addr, &ss, &sl);
+	if (bind(ctx.local_fd, (const struct sockaddr *)&ss, sl) < 0) {
+		pr_err("bind(local UDP %s): %s",
+		       netaddr_str(&cfg->listen_addr, abuf, sizeof(abuf)), strerror(errno));
 		return 1;
 	}
 
@@ -395,10 +404,9 @@ int client_main(const struct config *cfg)
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
 
-	pr_info("client relaying %s:%u <-> server %s:%u, max_sessions=%d",
-		inet_ntoa(cfg->listen_addr.sin_addr), ntohs(cfg->listen_addr.sin_port),
-		inet_ntoa(cfg->remote_addr.sin_addr), ntohs(cfg->remote_addr.sin_port),
-		cfg->max_sessions);
+	pr_info("client relaying %s <-> server %s, max_sessions=%d",
+		netaddr_str(&cfg->listen_addr, abuf, sizeof(abuf)),
+		netaddr_str(&cfg->remote_addr, rbuf, sizeof(rbuf)), cfg->max_sessions);
 
 	while (!g_stop) {
 		int n = epoll_wait(ctx.epoll_fd, events, 64, -1);
@@ -419,6 +427,7 @@ int client_main(const struct config *cfg)
 			} else if (events[i].data.ptr == &timer_fd) {
 				uint64_t exp;
 				ssize_t r = read(timer_fd, &exp, sizeof(exp));
+
 				(void)r;
 				send_keepalives(&ctx);
 				session_reap_expired(&ctx.pool, cfg->timeout_sec,

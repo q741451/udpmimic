@@ -1,11 +1,15 @@
 /*
  * session.h - fixed-capacity session pool + open hash table + LRU.
  *
- * Shared by both server and client:
- *  - server keys sessions by the client's outer (ip, port); each session
- *    owns a dedicated remote_fd connected to the real UDP backend.
- *  - client keys sessions by its own self-chosen outer TCP port (ip is
- *    unused, always 0); a second, caller-owned index (session->pnext)
+ * Shared by both server and client, and address-family-agnostic (a
+ * session's key/local/inner_peer can each independently be IPv4 or
+ * IPv6):
+ *  - server keys sessions by the client's outer (ip, port); each
+ *    session owns a dedicated remote_fd connected to the real UDP
+ *    backend.
+ *  - client keys sessions by its own self-chosen outer TCP port (ip
+ *    left zeroed, only the port matters since there is only one
+ *    remote server); a second, caller-owned index (session->pnext)
  *    is used by client.c to also look sessions up by local UDP peer
  *    address without touching this module.
  *
@@ -18,8 +22,8 @@
 
 #include <stdint.h>
 #include <time.h>
-#include <netinet/in.h>
 
+#include "common.h"
 #include "list.h"
 
 enum session_state {
@@ -34,15 +38,9 @@ struct session {
 	struct session *pnext;		/* free for caller use (client's 2nd index) */
 	struct list_head lru;
 
-	uint32_t key_ip;		/* network byte order; 0 on client */
-	uint16_t key_port;		/* host byte order */
-	uint32_t local_ip;		/* network byte order: our own addr for this session's
-					 * outgoing packets (server: learned from the SYN's
-					 * daddr, so multi-homed hosts reply from the same
-					 * address the client used; client: its outbound
-					 * interface addr, same value for every session) */
-
-	struct sockaddr_in inner_peer;	/* client only: local UDP peer this maps to */
+	struct netaddr key;		/* server: client's outer addr; client: (family=remote's, ip=0, port=our outer tcp port) */
+	struct netaddr local;		/* our own address for this session's outgoing packets */
+	struct netaddr inner_peer;	/* client only: local UDP peer this maps to */
 
 	uint32_t snd_nxt;
 	uint32_t rcv_nxt;
@@ -65,10 +63,10 @@ struct session_pool {
 int session_pool_init(struct session_pool *pool, size_t capacity);
 void session_pool_destroy(struct session_pool *pool);
 
-struct session *session_lookup(struct session_pool *pool, uint32_t ip, uint16_t port);
+struct session *session_lookup(struct session_pool *pool, const struct netaddr *key);
 
 /* Returns NULL if the pool is exhausted. Inserts into hash + LRU head. */
-struct session *session_create(struct session_pool *pool, uint32_t ip, uint16_t port);
+struct session *session_create(struct session_pool *pool, const struct netaddr *key);
 
 /* Marks activity: bumps last_active and moves to LRU head. */
 void session_touch(struct session_pool *pool, struct session *s);

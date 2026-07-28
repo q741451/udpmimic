@@ -11,14 +11,6 @@ static size_t next_pow2(size_t n)
 	return p;
 }
 
-static size_t hash_key(const struct session_pool *pool, uint32_t ip, uint16_t port)
-{
-	uint64_t k = ((uint64_t)ip << 16) | port;
-
-	k *= 0x9E3779B97F4A7C15ULL; /* Fibonacci hashing */
-	return (size_t)(k >> 48) & (pool->nbuckets - 1);
-}
-
 int session_pool_init(struct session_pool *pool, size_t capacity)
 {
 	size_t i;
@@ -58,19 +50,19 @@ void session_pool_destroy(struct session_pool *pool)
 	memset(pool, 0, sizeof(*pool));
 }
 
-struct session *session_lookup(struct session_pool *pool, uint32_t ip, uint16_t port)
+struct session *session_lookup(struct session_pool *pool, const struct netaddr *key)
 {
-	struct session *s = pool->buckets[hash_key(pool, ip, port)];
+	struct session *s = pool->buckets[netaddr_hash(pool->nbuckets, key)];
 
 	while (s) {
-		if (s->key_ip == ip && s->key_port == port)
+		if (netaddr_equal(&s->key, key))
 			return s;
 		s = s->hnext;
 	}
 	return NULL;
 }
 
-struct session *session_create(struct session_pool *pool, uint32_t ip, uint16_t port)
+struct session *session_create(struct session_pool *pool, const struct netaddr *key)
 {
 	struct session *s;
 	size_t b;
@@ -83,11 +75,10 @@ struct session *session_create(struct session_pool *pool, uint32_t ip, uint16_t 
 
 	memset(s, 0, sizeof(*s));
 	s->remote_fd = -1;
-	s->key_ip = ip;
-	s->key_port = port;
+	s->key = *key;
 	s->last_active = now_sec();
 
-	b = hash_key(pool, ip, port);
+	b = netaddr_hash(pool->nbuckets, key);
 	s->hnext = pool->buckets[b];
 	pool->buckets[b] = s;
 
@@ -105,7 +96,7 @@ void session_touch(struct session_pool *pool, struct session *s)
 
 void session_remove(struct session_pool *pool, struct session *s)
 {
-	struct session **pp = &pool->buckets[hash_key(pool, s->key_ip, s->key_port)];
+	struct session **pp = &pool->buckets[netaddr_hash(pool->nbuckets, &s->key)];
 
 	while (*pp) {
 		if (*pp == s) {
